@@ -62,16 +62,20 @@ class GCN(nn.Module):
     def forward(self, occ, prc):  # occ.shape = [batch, node, seq]
         x = torch.stack([occ, prc], dim=3)
         x = self.encoder(x)
+        x = x[:,:,:,-1]
+
         #  l1
         x = self.gcn_l1(x)
         x = torch.matmul(self.A, x)
+
         x = self.act(x)
         #  l2
         x = self.gcn_l2(x)
         x = torch.matmul(self.A, x)
         x = self.act(x)
         x = self.decoder(x)
-        return x
+
+        return x[:,:,-1]
 
 
 class LstmGcn(nn.Module):

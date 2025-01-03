@@ -45,10 +45,13 @@ test_dataset = fn.CreateDataset(test_occupancy, test_price, seq_l, pre_l, device
 test_loader = DataLoader(test_dataset, batch_size=len(test_occupancy), shuffle=False)
 
 # training setting
-model = models.PAG(a_sparse=adj_sparse).to(device)  # init model
-# model = FGN().to(device)
+# model = models.PAG(a_sparse=adj_sparse).to(device)  # init model
+model = baselines.FGN().to(device)
+# model = baselines.VAR().to(device)
+# model = baselines.GCN(seq_l, 2, adj_dense_cuda).to(device)
 # model = baselines.LSTM(seq_l, 2).to(device)
 # model = baselines.LstmGcn(seq_l, 2, adj_dense_cuda).to(device)
+# model = baselines.LstmGat(seq_l, 2, adj_dense_cuda, adj_sparse)
 optimizer = torch.optim.Adam(model.parameters(), weight_decay=0.00001)
 loss_function = torch.nn.MSELoss()
 valid_loss = 100
