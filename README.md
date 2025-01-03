@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 ## Spatio-temporal EVCDP (Shenzhen)
 
 This is a real-world dataset for spatio-temporal electric vehicle (EV) charging demand prediction. If it is helpful to your research, please cite our papers:
@@ -111,3 +112,6 @@ cd [path] && python main.py
 
 
 More updates will be posed in the near future! Thank you for your interest.
+=======
+# EVprediction
+>>>>>>> 11d07f2d0a5b49899143dee7c3291aed289fb50d
