@@ -10,9 +10,11 @@ import models
 import learner
 
 # system configuration
-use_cuda = True
+use_cuda = False
 device = torch.device("cuda:0" if use_cuda and torch.cuda.is_available() else "cpu")
 fn.set_seed(seed=2023, flag=True)
+
+torch.cuda.empty_cache()
 
 # hyper params
 model_name = 'PAG'
@@ -34,6 +36,7 @@ adj_sparse = adj_dense.to_sparse_coo().to(device)
 
 # dataset division
 train_occupancy, valid_occupancy, test_occupancy = fn.division(occ, train_rate=0.6, valid_rate=0.2, test_rate=0.2)
+nodes = train_occupancy.shape[-1]
 train_price, valid_price, test_price = fn.division(prc, train_rate=0.6, valid_rate=0.2, test_rate=0.2)
 
 # data
@@ -46,12 +49,16 @@ test_loader = DataLoader(test_dataset, batch_size=len(test_occupancy), shuffle=F
 
 # training setting
 # model = models.PAG(a_sparse=adj_sparse).to(device)  # init model
-model = baselines.FGN().to(device)
+# model = baselines.FGN()
 # model = baselines.VAR().to(device)
 # model = baselines.GCN(seq_l, 2, adj_dense_cuda).to(device)
 # model = baselines.LSTM(seq_l, 2).to(device)
+model = baselines.TransformerModel(seq_l, 32, 16, 2, 1, 4, 32, 0.5) # input_dim, embedding_dim, hidden_dim, output_dim, n_layers, n_heads, pf_dim, dropout
+# model = baselines.STGCN(247, 2, seq_l, 2, [64, 16, 64, 64, 64])
 # model = baselines.LstmGcn(seq_l, 2, adj_dense_cuda).to(device)
-# model = baselines.LstmGat(seq_l, 2, adj_dense_cuda, adj_sparse)
+# model = baselines.LstmGat(seq_l, 2, adj_dense_cuda, adj_sparse).to(device)
+# model = baselines.HSTGCN(seq_l, 2, adj_dense_cuda, adj_dense_cuda).to(device)
+# model = baselines.TPA(seq_l, 2, nodes).to(device)
 optimizer = torch.optim.Adam(model.parameters(), weight_decay=0.00001)
 loss_function = torch.nn.MSELoss()
 valid_loss = 100

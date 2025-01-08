@@ -5,6 +5,9 @@ import torch.nn.functional as F
 import functions as fn
 import copy
 
+from torch.nn import Transformer, TransformerEncoder, TransformerEncoderLayer
+from torch_geometric.nn import GraphConv
+
 use_cuda = True
 device = torch.device("cuda:0" if use_cuda and torch.cuda.is_available() else "cpu")
 fn.set_seed(seed=2023, flag=True)
@@ -39,6 +42,46 @@ class LSTM(nn.Module):
         x = self.decoder(x)
         x = torch.squeeze(x)
         return x
+
+class TransformerModel(nn.Module):
+    def __init__(self, input_dim, embedding_dim, hidden_dim, output_dim, n_layers, n_heads, pf_dim, dropout):
+        super().__init__()
+
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.pf_dim = pf_dim
+        self.dropout = dropout
+
+        self.input_linear = nn.Linear(24, embedding_dim)
+
+        self.encoder_layer = nn.TransformerEncoderLayer(embedding_dim, n_heads, pf_dim, dropout)
+        self.encoder = nn.TransformerEncoder(self.encoder_layer, n_layers)
+
+        # Adjust the output layer to produce a sequence of the same length as the input
+        self.fc = nn.Linear(embedding_dim, output_dim)  # output_dim should match the number of features you want per time step
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, occ, prc):
+        # Stack occ and prc together
+        x = torch.stack([occ, prc], dim=-1)
+        
+        # Reshape to (batch_size, sequence_length, features) where features=12*2=24
+        batch_size, seq_len, feature_size, _ = x.shape
+        x = x.view(batch_size, seq_len, feature_size * 2)
+        
+        # Pass through the linear layer
+        x = self.input_linear(x)
+
+        # Use Transformer encoder
+        embedded = self.dropout(x)
+        embedded = self.encoder(embedded)
+        
+        # Apply output layer to each sequence element
+        output = self.fc(embedded)
+        return output[:,:,-1]
 
 
 class GCN(nn.Module):
@@ -77,6 +120,63 @@ class GCN(nn.Module):
 
         return x[:,:,-1]
 
+class STGCN(nn.Module):
+    def __init__(self, num_nodes, num_features, num_timesteps_input, num_timesteps_output, num_channels):
+        super(STGCN, self).__init__()
+        
+        # Define the number of channels for each layer
+        self.num_channels = num_channels
+        
+        # Define the ST-Conv blocks
+        self.st_conv_blocks = nn.ModuleList([
+            STConvBlock(num_features, num_channels[0], num_channels[1], num_channels[2]),
+            STConvBlock(num_channels[1], num_channels[2], num_channels[3], num_channels[4])
+        ])
+        
+        # Define the output layer
+        self.output_layer = nn.Linear(num_channels[4], num_timesteps_output)
+        
+    def forward(self, x, edge_index):
+        # Process the input through the ST-Conv blocks
+        for block in self.st_conv_blocks:
+            x = block(x, edge_index)
+        
+        # Apply the output layer
+        x = self.output_layer(x)
+        
+        return x
+class STConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels_spatial, out_channels_temporal1, out_channels_temporal2):
+        super(STConvBlock, self).__init__()
+        
+        # Define the spatial graph convolution layer
+        self.graph_conv = GraphConv(in_channels, out_channels_spatial)
+        
+        # Define the temporal gated convolution layers
+        self.temporal_conv1 = nn.Conv1d(out_channels_spatial, out_channels_temporal1, kernel_size=3, padding=1)
+        self.temporal_conv2 = nn.Conv1d(out_channels_temporal1, out_channels_temporal2, kernel_size=3, padding=1)
+        
+        # Define the residual connection
+        self.residual_connection = nn.Conv1d(out_channels_temporal2, out_channels_spatial, kernel_size=1, bias=False)
+        
+    def forward(self, x, edge_index):
+        # Apply the spatial graph convolution layer
+        x_spatial = self.graph_conv(x, edge_index)
+        
+        # Apply the temporal gated convolution layers
+        x_temporal1 = self.temporal_conv1(x_spatial)
+        x_temporal2 = self.temporal_conv2(x_temporal1)
+        
+        # Apply the residual connection
+        x_residual = self.residual_connection(x_temporal2)
+        
+        # Add the residual connection to the output of the temporal gated convolution layers
+        x = x_temporal2 + x_residual
+        
+        # Apply the ReLU activation function
+        x = F.relu(x)
+        
+        return x
 
 class LstmGcn(nn.Module):
     def __init__(self, seq, n_fea, adj_dense):
@@ -151,7 +251,7 @@ class LstmGat(nn.Module):
         # lstm
         x = occ_conv2.transpose(1, 2)
         x, _ = self.lstm(x)
-        x = x.transpose(x, 1, 2)
+        x = x.transpose(1, 2)
 
         # decode
         x = self.decoder(x)
@@ -160,11 +260,14 @@ class LstmGat(nn.Module):
 
 
 class TPA(nn.Module):
-    def __init__(self, seq, n_fea):
+    def __init__(self, seq, n_fea, nodes):
         super(TPA, self).__init__()
+        self.nodes = nodes
+        self.seq = seq
+        self.n_fea = n_fea
         self.encoder = nn.Conv2d(self.nodes, self.nodes, (n_fea, n_fea), device=device)
         # TPA
-        self.lstm = nn.LSTM(2, 2, num_layers=2, batch_first=True, device=device)
+        self.lstm = nn.LSTM(self.seq - 1, 2, num_layers=2, batch_first=True, device=device)
         self.fc1 = nn.Linear(in_features=self.seq - 1, out_features=2, device=device)
         self.fc2 = nn.Linear(in_features=2, out_features=2, device=device)
         self.fc3 = nn.Linear(in_features=2 + 2, out_features=1, device=device)
@@ -175,7 +278,10 @@ class TPA(nn.Module):
         x = self.encoder(x)
         x = torch.squeeze(x)
 
+        print("Shape of x:", x.shape)
+
         # TPA
+        x = x.view(occ.shape[0] * occ.shape[1], occ.shape[2] - 1, self.n_fea)
         lstm_out, (_, _) = self.lstm(x)  # b*n, s, 2
         ht = lstm_out[:, -1, :]  # ht
         hw = lstm_out[:, :-1, :]  # from h(t-1) to h1
