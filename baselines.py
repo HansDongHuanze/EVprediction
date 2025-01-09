@@ -120,62 +120,63 @@ class GCN(nn.Module):
 
         return x[:,:,-1]
 
-class STGCN(nn.Module):
-    def __init__(self, num_nodes, num_features, num_timesteps_input, num_timesteps_output, num_channels):
-        super(STGCN, self).__init__()
-        
-        # Define the number of channels for each layer
-        self.num_channels = num_channels
-        
-        # Define the ST-Conv blocks
-        self.st_conv_blocks = nn.ModuleList([
-            STConvBlock(num_features, num_channels[0], num_channels[1], num_channels[2]),
-            STConvBlock(num_channels[1], num_channels[2], num_channels[3], num_channels[4])
-        ])
-        
-        # Define the output layer
-        self.output_layer = nn.Linear(num_channels[4], num_timesteps_output)
-        
-    def forward(self, x, edge_index):
-        # Process the input through the ST-Conv blocks
-        for block in self.st_conv_blocks:
-            x = block(x, edge_index)
-        
-        # Apply the output layer
-        x = self.output_layer(x)
-        
+class TemporalGatedConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(TemporalGatedConv, self).__init__()
+        self.causal_conv = nn.Conv1d(in_channels, out_channels, kernel_size, padding=kernel_size-1)
+        self.glu = nn.GLU(dim=1)
+
+    def forward(self, x):
+        # x.shape = [batch, node, seq]
+        x = self.causal_conv(x)  # Apply causal convolution
+        return self.glu(x)  # Apply GLU
+
+class SpatialGraphConv(nn.Module):
+    def __init__(self, in_features, out_features, adj_dense):
+        super(SpatialGraphConv, self).__init__()
+        self.A = adj_dense
+        self.linear = nn.Linear(in_features, out_features)
+
+        # Calculate A_delta matrix
+        deg = torch.sum(adj_dense, dim=0)
+        deg = torch.diag(deg)
+        deg_delta = torch.linalg.inv(torch.sqrt(deg))
+        self.A = torch.matmul(torch.matmul(deg_delta, adj_dense), deg_delta)
+
+    def forward(self, x):
+        # x.shape = [batch, node, seq]
+        x = self.linear(x)
+        x = torch.matmul(self.A, x)
         return x
-class STConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels_spatial, out_channels_temporal1, out_channels_temporal2):
-        super(STConvBlock, self).__init__()
-        
-        # Define the spatial graph convolution layer
-        self.graph_conv = GraphConv(in_channels, out_channels_spatial)
-        
-        # Define the temporal gated convolution layers
-        self.temporal_conv1 = nn.Conv1d(out_channels_spatial, out_channels_temporal1, kernel_size=3, padding=1)
-        self.temporal_conv2 = nn.Conv1d(out_channels_temporal1, out_channels_temporal2, kernel_size=3, padding=1)
-        
-        # Define the residual connection
-        self.residual_connection = nn.Conv1d(out_channels_temporal2, out_channels_spatial, kernel_size=1, bias=False)
-        
-    def forward(self, x, edge_index):
-        # Apply the spatial graph convolution layer
-        x_spatial = self.graph_conv(x, edge_index)
-        
-        # Apply the temporal gated convolution layers
-        x_temporal1 = self.temporal_conv1(x_spatial)
-        x_temporal2 = self.temporal_conv2(x_temporal1)
-        
-        # Apply the residual connection
-        x_residual = self.residual_connection(x_temporal2)
-        
-        # Add the residual connection to the output of the temporal gated convolution layers
-        x = x_temporal2 + x_residual
-        
-        # Apply the ReLU activation function
-        x = F.relu(x)
-        
+
+class STGCN(nn.Module):
+    def __init__(self, seq, n_fea, adj_dense):
+        super(STGCN, self).__init__()
+        self.temporal_conv1 = TemporalGatedConv(n_fea, n_fea, kernel_size=3)
+        self.spatial_conv = SpatialGraphConv(n_fea, n_fea, adj_dense)
+        self.temporal_conv2 = TemporalGatedConv(n_fea, n_fea, kernel_size=3)
+        self.decoder = nn.Linear(n_fea, 1)
+
+    def forward(self, occ, prc):  # occ.shape = [batch, node, seq]
+        x = torch.stack([occ, prc], dim=1)  # Shape: [batch, 2, node, seq]
+        x = x.permute(0, 2, 3, 1)  # Shape: [batch, node, seq, 2]
+        x = x.view(x.size(0), x.size(1), -1, x.size(3))  # Shape: [batch, node, seq, features]
+
+        # Temporal Convolution Layer 1
+        residual = x  # Save input for residual connection
+        x = self.temporal_conv1(x)  # Apply temporal gated conv
+        x = x + residual  # Residual connection
+
+        # Spatial Graph Convolution Layer
+        x = self.spatial_conv(x)  # Apply spatial graph conv
+
+        # Temporal Convolution Layer 2
+        residual = x  # Save input for residual connection
+        x = self.temporal_conv2(x)  # Apply temporal gated conv
+        x = x + residual  # Residual connection
+
+        # Final output
+        x = self.decoder(x[:, :, -1, :])  # Get final output for the last time step
         return x
 
 class LstmGcn(nn.Module):

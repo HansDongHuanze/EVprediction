@@ -53,8 +53,8 @@ test_loader = DataLoader(test_dataset, batch_size=len(test_occupancy), shuffle=F
 # model = baselines.VAR().to(device)
 # model = baselines.GCN(seq_l, 2, adj_dense_cuda).to(device)
 # model = baselines.LSTM(seq_l, 2).to(device)
-model = baselines.TransformerModel(seq_l, 32, 16, 2, 1, 4, 32, 0.5) # input_dim, embedding_dim, hidden_dim, output_dim, n_layers, n_heads, pf_dim, dropout
-# model = baselines.STGCN(247, 2, seq_l, 2, [64, 16, 64, 64, 64])
+# model = baselines.TransformerModel(seq_l, 32, 16, 2, 1, 4, 32, 0.5) # input_dim, embedding_dim, hidden_dim, output_dim, n_layers, n_heads, pf_dim, dropout
+model = baselines.STGCN(seq_l, 2, adj_dense_cuda)
 # model = baselines.LstmGcn(seq_l, 2, adj_dense_cuda).to(device)
 # model = baselines.LstmGat(seq_l, 2, adj_dense_cuda, adj_sparse).to(device)
 # model = baselines.HSTGCN(seq_l, 2, adj_dense_cuda, adj_dense_cuda).to(device)
