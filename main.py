@@ -8,9 +8,11 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import models
 import learner
+import time
+import GAF
 
 # system configuration
-use_cuda = False
+use_cuda = True
 device = torch.device("cuda:0" if use_cuda and torch.cuda.is_available() else "cpu")
 fn.set_seed(seed=2023, flag=True)
 
@@ -29,7 +31,7 @@ mode = 'completed'  # 'simplified' or 'completed'
 is_pre_train = True
 
 # input data
-occ, prc, adj, col, dis, cap, time, inf = fn.read_dataset()
+occ, prc, adj, col, dis, cap, tim, inf = fn.read_dataset()
 adj_dense = torch.Tensor(adj)
 adj_dense_cuda = adj_dense.to(device)
 adj_sparse = adj_dense.to_sparse_coo().to(device)
@@ -51,15 +53,19 @@ test_loader = DataLoader(test_dataset, batch_size=len(test_occupancy), shuffle=F
 # model = models.PAG(a_sparse=adj_sparse).to(device)  # init model
 # model = baselines.FGN()
 # model = baselines.VAR().to(device)
+# model = baselines.FCN().to(device)
 # model = baselines.GCN(seq_l, 2, adj_dense_cuda).to(device)
+model = baselines.GAT(seq_l, 2, adj_dense_cuda).to(device)
 # model = baselines.LSTM(seq_l, 2).to(device)
 # model = baselines.TransformerModel(seq_l, 32, 16, 2, 1, 4, 32, 0.5) # input_dim, embedding_dim, hidden_dim, output_dim, n_layers, n_heads, pf_dim, dropout
-model = baselines.STGCN(seq_l, 2, adj_dense_cuda)
+# model = baselines.STGCN(seq_l, 2, adj_dense_cuda).to(device)
 # model = baselines.LstmGcn(seq_l, 2, adj_dense_cuda).to(device)
 # model = baselines.LstmGat(seq_l, 2, adj_dense_cuda, adj_sparse).to(device)
 # model = baselines.HSTGCN(seq_l, 2, adj_dense_cuda, adj_dense_cuda).to(device)
 # model = baselines.TPA(seq_l, 2, nodes).to(device)
+# model = GAF.GATWithFourier(seq_l, 2, adj_dense_cuda).to(device)
 optimizer = torch.optim.Adam(model.parameters(), weight_decay=0.00001)
+
 loss_function = torch.nn.MSELoss()
 valid_loss = 100
 
@@ -112,11 +118,36 @@ model.eval()
 result_list = []
 predict_list = np.zeros([1, adj_dense.shape[1]])
 label_list = np.zeros([1, adj_dense.shape[1]])
+
+# Initialize lists to store time and memory usage
+time_list = []
+memory_list = []
+
 for j, data in enumerate(test_loader):
     occupancy, price, label = data  # occupancy.shape = [batch, seq, node]
     print('occupancy:', occupancy.shape, 'price:', price.shape, 'label:', label.shape)
     with torch.no_grad():
+        # Start time measurement
+        start_time = time.time()
+        
+        # Start memory tracking
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()  # Synchronize before measuring
+            memory_before = torch.cuda.memory_allocated()
+
         predict = model(occupancy, price)
+
+        # End memory tracking
+        if torch.cuda.is_available():
+            memory_after = torch.cuda.memory_allocated()
+            memory_usage = memory_after - memory_before
+            memory_list.append(memory_usage / (1024 * 1024))  # Convert bytes to MB
+        
+        # End time measurement
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        time_list.append(elapsed_time)
+
         predict = predict.cpu().detach().numpy()
         label = label.cpu().detach().numpy()
         predict_list = np.concatenate((predict_list, predict), axis=0)
@@ -126,3 +157,7 @@ output_no_noise = fn.metrics(test_pre=predict_list[1:, :], test_real=label_list[
 result_list.append(output_no_noise)
 result_df = pd.DataFrame(columns=['MSE', 'RMSE', 'MAPE', 'RAE', 'MAE', 'R2'], data=result_list)
 result_df.to_csv('./results' + '/' + model_name + '_' + str(pre_l) + 'bs' + str(bs) + '.csv', encoding='gbk')
+
+# Print average time and memory usage
+print(f'Average time per prediction: {np.mean(time_list)} seconds')
+print(f'Average memory usage per prediction: {np.mean(memory_list)} MB')

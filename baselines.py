@@ -6,7 +6,7 @@ import functions as fn
 import copy
 
 from torch.nn import Transformer, TransformerEncoder, TransformerEncoderLayer
-from torch_geometric.nn import GraphConv
+from torch_geometric.nn import GATConv
 
 use_cuda = True
 device = torch.device("cuda:0" if use_cuda and torch.cuda.is_available() else "cpu")
@@ -24,6 +24,33 @@ class VAR(nn.Module):
         x = self.linear(x)
         return x
 
+class FCN(nn.Module):
+    def __init__(self, node=247, seq=12, feature=2, hidden_dim=128, num_layers=2):
+        super(FCN, self).__init__()
+        input_dim = node * seq * feature
+        
+        # 定义一个简单的全连接层序列
+        layers = []
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.ReLU())  # 使用 ReLU 作为激活函数
+        
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+        
+        layers.append(nn.Linear(hidden_dim, node))
+        
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, occ, prc):
+        # 合并和展平输入数据
+        x = torch.cat((occ, prc), dim=2)
+        x = torch.flatten(x, 1, 2)
+        
+        # 前向传播
+        x = self.network(x)
+        
+        return x
 
 class LSTM(nn.Module):
     def __init__(self, seq, n_fea, node=247):
@@ -117,19 +144,57 @@ class GCN(nn.Module):
         x = torch.matmul(self.A, x)
         x = self.act(x)
         x = self.decoder(x)
-
         return x[:,:,-1]
+    
+class GAT(nn.Module):
+    def __init__(self, seq, n_fea, adj_dense, out_features=1, dropout=0.6, alpha=0.2):
+        super(GAT, self).__init__()
+        self.nodes = adj_dense.shape[0]
+        self.dropout = dropout
+        self.seq = seq
+
+        # 初始化 GATConv 层
+        self.gat1 = GATConv(n_fea, 3, dropout=dropout, heads=3)
+        self.gat2 = GATConv(9, out_features, dropout=dropout, heads=1)
+        self.decoder = nn.Linear(seq, 1)
+        self.adj = adj_dense
+
+    def forward(self, occ, prc):
+        x = torch.stack([occ, prc], dim=2)  # x.shape: (batch, node, seq, 2)
+        x = x.view(-1, x.size(2))  # Flatten batch and node dimensions
+
+        # 需要将 adj_dense 转换为 edge_index 格式
+        edge_index = self.adj.nonzero(as_tuple=False).t().contiguous()
+
+        # 调用 GATConv 层
+        x = self.gat1(x, edge_index)
+        x = F.elu(x)
+        x = self.gat2(x, edge_index)
+
+        x = F.dropout(x, self.dropout, training=self.training)
+
+        x = x.view(-1, self.nodes, self.seq)  # Reshape back to (batch, node, seq)
+        x = self.decoder(x)
+        return x.squeeze(-1)
 
 class TemporalGatedConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size):
         super(TemporalGatedConv, self).__init__()
-        self.causal_conv = nn.Conv1d(in_channels, out_channels, kernel_size, padding=kernel_size-1)
+        self.causal_conv = nn.Conv1d(in_channels, out_channels * 2, kernel_size, padding=1)  # GLU requires out_channels * 2
         self.glu = nn.GLU(dim=1)
 
     def forward(self, x):
-        # x.shape = [batch, node, seq]
+        # x.shape = [batch, node, seq, features]
+        batch_size, node, seq, features = x.size()
+        x = x.reshape(batch_size * node, features, seq)  # Reshape to [batch_size * node, features, seq]
         x = self.causal_conv(x)  # Apply causal convolution
-        return self.glu(x)  # Apply GLU
+        x = self.glu(x)  # Apply GLU
+        
+        # Check output shape after causal_conv
+        # Output shape will be [batch_size * node, out_channels, seq]
+        out_channels = self.causal_conv.out_channels // 2  # Since we used GLU
+        x = x.reshape(batch_size, node, out_channels, seq)  # Reshape back to [batch_size, node, out_channels, seq]
+        return x
 
 class SpatialGraphConv(nn.Module):
     def __init__(self, in_features, out_features, adj_dense):
@@ -144,9 +209,12 @@ class SpatialGraphConv(nn.Module):
         self.A = torch.matmul(torch.matmul(deg_delta, adj_dense), deg_delta)
 
     def forward(self, x):
-        # x.shape = [batch, node, seq]
-        x = self.linear(x)
-        x = torch.matmul(self.A, x)
+        # x.shape = [batch, node, seq, features]
+        batch_size, node, features, seq = x.size()
+        x = x.reshape(batch_size * node, seq, features)
+        x = self.linear(x)  # Apply linear transformation
+        x = x.reshape(batch_size, -1, seq, node)  # Reshape back to [batch_size, node, seq, out_features]
+        x = torch.matmul(x, self.A)  # Apply spatial graph conv
         return x
 
 class STGCN(nn.Module):
@@ -155,7 +223,7 @@ class STGCN(nn.Module):
         self.temporal_conv1 = TemporalGatedConv(n_fea, n_fea, kernel_size=3)
         self.spatial_conv = SpatialGraphConv(n_fea, n_fea, adj_dense)
         self.temporal_conv2 = TemporalGatedConv(n_fea, n_fea, kernel_size=3)
-        self.decoder = nn.Linear(n_fea, 1)
+        self.decoder = nn.Linear(n_fea * seq, 1)
 
     def forward(self, occ, prc):  # occ.shape = [batch, node, seq]
         x = torch.stack([occ, prc], dim=1)  # Shape: [batch, 2, node, seq]
@@ -165,19 +233,22 @@ class STGCN(nn.Module):
         # Temporal Convolution Layer 1
         residual = x  # Save input for residual connection
         x = self.temporal_conv1(x)  # Apply temporal gated conv
-        x = x + residual  # Residual connection
+        dim1, dim2, dim3, dim4 = x.shape
+        x = x + residual.reshape(dim1, dim2, dim3, -1)  # Residual connection
 
         # Spatial Graph Convolution Layer
         x = self.spatial_conv(x)  # Apply spatial graph conv
 
         # Temporal Convolution Layer 2
+        x = x.reshape(dim1, dim2, dim4, dim3)
         residual = x  # Save input for residual connection
         x = self.temporal_conv2(x)  # Apply temporal gated conv
-        x = x + residual  # Residual connection
+        x = x + residual.reshape(dim1, dim2, dim3, -1)  # Residual connection
 
         # Final output
-        x = self.decoder(x[:, :, -1, :])  # Get final output for the last time step
-        return x
+        dim = x.shape
+        x = self.decoder(x.reshape(dim[0], dim[1], -1))  # Get final output for the last time step
+        return x[:, :, -1]
 
 class LstmGcn(nn.Module):
     def __init__(self, seq, n_fea, adj_dense):
