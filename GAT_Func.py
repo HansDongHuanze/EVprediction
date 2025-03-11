@@ -5,6 +5,9 @@ import torch.nn.functional as F
 import functions as fn
 import copy
 
+import math
+from torch.utils.checkpoint import checkpoint
+
 from torch.nn import Transformer, TransformerEncoder, TransformerEncoderLayer
 
 use_cuda = True
@@ -13,13 +16,24 @@ fn.set_seed(seed=2023, flag=True)
 
 class GraphAttentionLayer(nn.Module):
 
-    def __init__(self, in_features, out_features, dropout, alpha, concat=True, num_nodes=247):
+    def __init__(self, in_features, out_features, dropout, alpha, 
+                 concat=True, num_nodes=247, hidden_size_factor=1, embed_size=32, sparsity_threshold=0.01):
         super(GraphAttentionLayer, self).__init__()
         self.dropout = dropout
         self.in_features = in_features
         self.out_features = out_features
         self.alpha = alpha
         self.concat = concat
+        self.num_nodes = num_nodes
+
+        '''self.embed_size = embed_size
+        self.number_frequency = 1
+        self.frequency_size = self.embed_size // self.number_frequency
+        self.embeddings = nn.Parameter(torch.randn(1, self.embed_size))
+        self.decoder2 = nn.Linear(self.embed_size, 1)
+        self.hidden_size_factor = hidden_size_factor
+        self.scale = 0.02
+        self.sparsity_threshold=sparsity_threshold'''
 
         self.W = nn.Parameter(torch.zeros(size=(in_features, out_features)))
         nn.init.kaiming_normal_(self.W, mode='fan_out', nonlinearity='leaky_relu')
@@ -30,11 +44,34 @@ class GraphAttentionLayer(nn.Module):
         # self.NodeWiseTransform = NodeWiseTransform(num_nodes)
         self.norm = nn.LayerNorm(out_features)
 
+        '''self.w1 = nn.Parameter(
+            self.scale * torch.randn(2, self.frequency_size, self.frequency_size * self.hidden_size_factor))
+        self.b1 = nn.Parameter(self.scale * torch.randn(2, self.frequency_size * self.hidden_size_factor))
+        self.w2 = nn.Parameter(
+            self.scale * torch.randn(2, self.frequency_size * self.hidden_size_factor, self.frequency_size))
+        self.b2 = nn.Parameter(self.scale * torch.randn(2, self.frequency_size))'''
+
         self.leakyrelu = nn.LeakyReLU(self.alpha)
+
+        '''self.W_q = nn.ParameterList([
+            nn.Parameter(torch.randn((num_nodes * in_features) // 2 + 1, (num_nodes * in_features) // 2 + 1)),
+            nn.Parameter(torch.randn((num_nodes * in_features) // 2 + 1, (num_nodes * in_features) // 2 + 1))
+        ])
+        self.W_k = nn.ParameterList([
+            nn.Parameter(torch.randn((num_nodes * in_features) // 2 + 1, (num_nodes * in_features) // 2 + 1)),
+            nn.Parameter(torch.randn((num_nodes * in_features) // 2 + 1, (num_nodes * in_features) // 2 + 1))
+        ])
+        self.W_v = nn.ParameterList([
+            nn.Parameter(torch.randn((num_nodes * in_features) // 2 + 1, (num_nodes * in_features) // 2 + 1)),
+            nn.Parameter(torch.randn((num_nodes * in_features) // 2 + 1, (num_nodes * in_features) // 2 + 1))
+        ])'''
 
     def forward(self, input, adj):
         # input = node_wise_operation(input)
-        input = self.node_wise_matrix(input) + input
+        res = input
+        input = F.dropout(input, self.dropout, training=self.training)
+        # input = self.node_wise_matrix(input) + self.FGCN(input) + res
+        input = self.node_wise_matrix(input) + res
         # input = self.NodeWiseTransform(input)
         batch_size, N, _ = input.size()
         if adj.dim() == 3:
@@ -70,17 +107,177 @@ class GraphAttentionLayer(nn.Module):
             return h_prime
         
     def node_wise_matrix(self, x):
-        return x * self.node_weights.view(1, -1, 1) + self.node_bias.view(1, -1, 1)
+        return x * self.node_weights.view(1, -1, 1) + self.node_bias.view(1, -1, 1) 
+    
+    def tokenEmb(self, x):
+        x = x.unsqueeze(2)
+        y = self.embeddings
+        return x * y
+    
+    def FGCN(self, x):
+        B, N, L = x.shape
+        res = x
+        # B*N*L ==> B*NL
+        x = x.reshape(B, -1)
+        # embedding B*NL ==> B*NL*D
+        x = self.tokenEmb(x)
+        x = torch.fft.rfft(x, dim=1, norm='ortho')
+
+        x = x.reshape(B, self.frequency_size, (N*L)//2+1)
+
+        # FourierGNN
+        # x = self.fourierGC(x, B, (N*L)//2 + 1, self.frequency_size)
+
+        x = checkpoint(
+            self.freq_attention,  # 要包装的函数
+            x,                    # 第一个输入参数
+            B,                    # 第二个参数batch_size
+            (N*L)//2+1,                 # 频率维度大小
+            self.frequency_size,                    # 特征维度大小
+            preserve_rng_state=False,  # 不保存RNG状态以节省内存
+            use_reentrant=False   # 推荐设置（适用于PyTorch 1.11+）
+        )
+
+        x = x.reshape(B, (N*L)//2+1, self.embed_size)
+
+        # ifft
+        x = torch.fft.irfft(x, n=N*L, dim=1, norm="ortho")
+        x = x.reshape(B, N, L, self.embed_size)
+        x = self.decoder2(x)
+        x = x.view(B, N, L)
+        return x + res
+    
+    # FourierGNN
+    def fourierGC(self, x, B, N, L):
+        o1_real = torch.zeros([B, (N*L)//2 + 1, self.frequency_size * self.hidden_size_factor],
+                              device=x.device)
+        o1_imag = torch.zeros([B, (N*L)//2 + 1, self.frequency_size * self.hidden_size_factor],
+                              device=x.device)
+
+        o1_real = F.relu(
+            torch.einsum('bli,ii->bli', x.real, self.w1[0]) - \
+            torch.einsum('bli,ii->bli', x.imag, self.w1[1]) + \
+            self.b1[0]
+        )
+
+        o1_imag = F.relu(
+            torch.einsum('bli,ii->bli', x.imag, self.w1[0]) + \
+            torch.einsum('bli,ii->bli', x.real, self.w1[1]) + \
+            self.b1[1]
+        )
+
+        y = torch.stack([o1_real, o1_imag], dim=-1)
+        y = F.softshrink(y, lambd=self.sparsity_threshold)
+
+        o2_real = F.relu(
+            torch.einsum('bli,ii->bli', o1_real, self.w2[0]) - \
+            torch.einsum('bli,ii->bli', o1_imag, self.w2[1]) + \
+            self.b2[0]
+        )
+
+        o2_imag = F.relu(
+            torch.einsum('bli,ii->bli', o1_imag, self.w2[0]) + \
+            torch.einsum('bli,ii->bli', o1_real, self.w2[1]) + \
+            self.b2[1]
+        )
+
+        # 2 layer
+        x = torch.stack([o2_real, o2_imag], dim=-1)
+        x = F.softshrink(x, lambd=self.sparsity_threshold)
+        x = x + y
+
+        x = torch.view_as_complex(x)
+        return x
+
+    def freq_attention(self, x, B, N, L):
+        x_real = x.real
+        x_imag = x.imag
+
+        Q_real = torch.einsum('bli,io->blo', x_real, self.W_q[0]) - torch.einsum('bli,io->blo', x_imag, self.W_q[1])
+        Q_imag = torch.einsum('bli,io->blo', x_imag, self.W_q[0]) + torch.einsum('bli,io->blo', x_real, self.W_q[1])
+        Q = torch.stack([Q_real, Q_imag], dim=-1)
+
+        K_real = torch.einsum('bli,io->blo', x_real, self.W_k[0]) - torch.einsum('bli,io->blo', x_imag, self.W_k[1])
+        K_imag = torch.einsum('bli,io->blo', x_imag, self.W_k[0]) + torch.einsum('bli,io->blo', x_real, self.W_k[1])
+        K = torch.stack([K_real, K_imag], dim=-1)
+
+        V_real = torch.einsum('bli,io->blo', x_real, self.W_v[0]) - torch.einsum('bli,io->blo', x_imag, self.W_v[1])
+        V_imag = torch.einsum('bli,io->blo', x_imag, self.W_v[0]) + torch.einsum('bli,io->blo', x_real, self.W_v[1])
+        V = torch.stack([V_real, V_imag], dim=-1)
+
+        Q_complex = torch.view_as_complex(Q)
+        K_complex = torch.view_as_complex(K)
+        V_complex = torch.view_as_complex(V)
+        
+        scale = 1 / math.sqrt(N)
+
+        scores = torch.einsum('bik,bjk->bij', Q_complex, K_complex) * scale
+
+        mask = torch.triu(
+            torch.ones(L, L, dtype=torch.bool, device=x.device), 
+            diagonal=1
+        ).transpose(0, 1)
+        mask = mask.unsqueeze(0).expand(B, -1, -1)
+        scores = scores.masked_fill(mask, -float('inf'))
+
+        attention = torch.softmax(scores.real, dim=-1)
+        output = attention @ V_complex.real
+
+        return output
 
 def node_wise_operation(x):
     mean = x.mean(dim=-1, keepdim=True)  # [batch, nodes, 1]
     std = x.std(dim=-1, keepdim=True)    # [batch, nodes, 1]
     return (x - mean) / (std + 1e-8)
 
+class GateFusion(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        self.gate_block=nn.Sequential(
+             nn.Linear(in_dim*2,in_dim),
+             nn.Dropout(p=.5),
+             nn.LayerNorm(in_dim),
+             nn.GELU(),
+             nn.Linear(in_dim,in_dim),
+             nn.Sigmoid()
+         )
+         
+        self._initialize_weights()
+
+    def _initialize_weights(self):  
+        """Kaiming initialization with fan-out mode"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):                      
+                nn.init.xavier_normal_(m.weight)
+    
+    def forward(self, heads):
+        avg_pool = torch.mean(heads, dim=0)
+        max_pool = torch.max(heads, dim=0)[0]
+        gate = self.gate_block(torch.cat([avg_pool,max_pool],dim=-1))
+        return gate * avg_pool + (1-gate) * max_pool
+
 class GAT_Multi(nn.Module):
-    def __init__(self, nfeat, nhid, nclass, dropout, alpha, nheads):
+    def __init__(self, nfeat, nhid, nclass, dropout, alpha, nheads, adj, num_nodes = 247, hidden_size_factor=1, embed_size=32, sparsity_threshold=0.01):
         super(GAT_Multi, self).__init__()
+        self.adj = adj
         self.dropout = dropout
+        self.embed_size = embed_size
+        self.number_frequency = 1
+        self.frequency_size = self.embed_size // self.number_frequency
+        self.embeddings = nn.Parameter(torch.randn(1, self.embed_size))
+        self.decoder2 = nn.Linear(self.embed_size, 1)
+        self.hidden_size_factor = hidden_size_factor
+        self.scale = 0.02
+        self.sparsity_threshold=sparsity_threshold
+
+        self.embed_size = embed_size
+        self.number_frequency = 1
+        self.frequency_size = self.embed_size // self.number_frequency
+        self.embeddings = nn.Parameter(torch.randn(1, self.embed_size))
+        self.decoder2 = nn.Linear(self.embed_size, 1)
+        self.hidden_size_factor = hidden_size_factor
+        self.scale = 0.02
+        self.sparsity_threshold=sparsity_threshold
 
         self.attentions = nn.ModuleList([
             GraphAttentionLayer(nfeat, nhid//nheads, dropout, alpha) 
@@ -91,26 +288,169 @@ class GAT_Multi(nn.Module):
             self.add_module('attention_{}'.format(i), attention)
         self.norm = nn.LayerNorm(nhid)
         self.out_att = GraphAttentionLayer(nhid * nheads, nclass, dropout=dropout, alpha=alpha, concat=False)
-        self.encoder = nn.Linear(nfeat, 64)
+        self.encoder = nn.Linear(2, 1)
         self.activate = nn.LeakyReLU(0.01)
-        self.decoder = nn.Linear(64, 1)
+        self.decoder = nn.Linear(nfeat, 1)
+        self.mapping = nn.Linear(nfeat, nfeat)
 
-    def forward(self, x, adj):
+        self.gate_fusion = GateFusion(in_dim=nhid)
+
+        self.W_q = nn.ParameterList([
+            nn.Parameter(torch.randn((num_nodes * nfeat) // 2 + 1, (num_nodes * nfeat) // 2 + 1)),
+            nn.Parameter(torch.randn((num_nodes * nfeat) // 2 + 1, (num_nodes * nfeat) // 2 + 1))
+        ])
+        self.W_k = nn.ParameterList([
+            nn.Parameter(torch.randn((num_nodes * nfeat) // 2 + 1, (num_nodes * nfeat) // 2 + 1)),
+            nn.Parameter(torch.randn((num_nodes * nfeat) // 2 + 1, (num_nodes * nfeat) // 2 + 1))
+        ])
+        self.W_v = nn.ParameterList([
+            nn.Parameter(torch.randn((num_nodes * nfeat) // 2 + 1, (num_nodes * nfeat) // 2 + 1)),
+            nn.Parameter(torch.randn((num_nodes * nfeat) // 2 + 1, (num_nodes * nfeat) // 2 + 1))
+        ])
+
+    def forward(self, x, prc):
         residual = x
-        x = F.dropout(x, self.dropout, training=self.training)
+        x = torch.stack([x, prc], dim=3)
+        x = self.encoder(x)
+        x = torch.squeeze(x)
+        # x = F.dropout(x, self.dropout, training=self.training)
+        x = self.FGCN(x) + residual
         multi_head_outputs = []
         for att in self.attentions:
-            att_output = att(x, adj)  # [batch_size, N, nhid]
+            att_output = att(x, self.adj)  # [batch_size, N, nhid]qqq
             att_output = self.norm(att_output)
             multi_head_outputs.append(att_output)
 
-        x = torch.cat(multi_head_outputs, dim=-1)  # [batch_size, N, nhid * nheads]
+        heads_stack = torch.stack(multi_head_outputs, dim=1)  # [B,num_heads,N,dim]
+        fused_features = []
+
+        for i in range(heads_stack.size(2)):  # 对每个节点独立做融合
+            node_features = heads_stack[:, :, i]      # [B,num_heads,dim]
+            fused_node_feature = self.gate_fusion(node_features)   # [B,dim]
+            fused_features.append(fused_node_feature)
+        x = torch.stack(fused_features, dim=1)
+        
         x = F.dropout(x, self.dropout, training=self.training)
-        x = F.elu(self.out_att(x, adj)) + residual  # [batch_size, N, nclass]
-        x = self.encoder(x)
+        x = F.elu(self.out_att(x, self.adj)) + residual  # [batch_size, N, nclass]
         x = self.activate(x)
         x = self.decoder(x) + residual
         return x[:,:,-1]
+    
+    def tokenEmb(self, x):
+        x = x.unsqueeze(2)
+        y = self.embeddings
+        return x * y
+    
+    def FGCN(self, x):
+        B, N, L = x.shape
+        res = x
+        # B*N*L ==> B*NL
+        x = x.reshape(B, -1)
+        # embedding B*NL ==> B*NL*D
+        x = self.tokenEmb(x)
+        x = torch.fft.rfft(x, dim=1, norm='ortho')
+
+        x = x.reshape(B, self.frequency_size, (N*L)//2+1)
+
+        # FourierGNN
+        # x = self.fourierGC(x, B, (N*L)//2 + 1, self.frequency_size)
+
+        x = checkpoint(
+            self.freq_attention,  # 要包装的函数
+            x,                    # 第一个输入参数
+            B,                    # 第二个参数batch_size
+            (N*L)//2+1,                 # 频率维度大小
+            self.frequency_size,                    # 特征维度大小
+            preserve_rng_state=False,  # 不保存RNG状态以节省内存
+            use_reentrant=False   # 推荐设置（适用于PyTorch 1.11+）
+        )
+
+        x = x.reshape(B, (N*L)//2+1, self.embed_size)
+
+        # ifft
+        x = torch.fft.irfft(x, n=N*L, dim=1, norm="ortho")
+        x = x.reshape(B, N, L, self.embed_size)
+        x = self.decoder2(x)
+        x = x.view(B, N, L)
+        return x + res
+    
+    # FourierGNN
+    def fourierGC(self, x, B, N, L):
+        o1_real = torch.zeros([B, (N*L)//2 + 1, self.frequency_size * self.hidden_size_factor],
+                              device=x.device)
+        o1_imag = torch.zeros([B, (N*L)//2 + 1, self.frequency_size * self.hidden_size_factor],
+                              device=x.device)
+
+        o1_real = F.relu(
+            torch.einsum('bli,ii->bli', x.real, self.w1[0]) - \
+            torch.einsum('bli,ii->bli', x.imag, self.w1[1]) + \
+            self.b1[0]
+        )
+
+        o1_imag = F.relu(
+            torch.einsum('bli,ii->bli', x.imag, self.w1[0]) + \
+            torch.einsum('bli,ii->bli', x.real, self.w1[1]) + \
+            self.b1[1]
+        )
+
+        y = torch.stack([o1_real, o1_imag], dim=-1)
+        y = F.softshrink(y, lambd=self.sparsity_threshold)
+
+        o2_real = F.relu(
+            torch.einsum('bli,ii->bli', o1_real, self.w2[0]) - \
+            torch.einsum('bli,ii->bli', o1_imag, self.w2[1]) + \
+            self.b2[0]
+        )
+
+        o2_imag = F.relu(
+            torch.einsum('bli,ii->bli', o1_imag, self.w2[0]) + \
+            torch.einsum('bli,ii->bli', o1_real, self.w2[1]) + \
+            self.b2[1]
+        )
+
+        # 2 layer
+        x = torch.stack([o2_real, o2_imag], dim=-1)
+        x = F.softshrink(x, lambd=self.sparsity_threshold)
+        x = x + y
+
+        x = torch.view_as_complex(x)
+        return x
+
+    def freq_attention(self, x, B, N, L):
+        x_real = x.real
+        x_imag = x.imag
+
+        Q_real = torch.einsum('bli,io->blo', x_real, self.W_q[0]) - torch.einsum('bli,io->blo', x_imag, self.W_q[1])
+        Q_imag = torch.einsum('bli,io->blo', x_imag, self.W_q[0]) + torch.einsum('bli,io->blo', x_real, self.W_q[1])
+        Q = torch.stack([Q_real, Q_imag], dim=-1)
+
+        K_real = torch.einsum('bli,io->blo', x_real, self.W_k[0]) - torch.einsum('bli,io->blo', x_imag, self.W_k[1])
+        K_imag = torch.einsum('bli,io->blo', x_imag, self.W_k[0]) + torch.einsum('bli,io->blo', x_real, self.W_k[1])
+        K = torch.stack([K_real, K_imag], dim=-1)
+
+        V_real = torch.einsum('bli,io->blo', x_real, self.W_v[0]) - torch.einsum('bli,io->blo', x_imag, self.W_v[1])
+        V_imag = torch.einsum('bli,io->blo', x_imag, self.W_v[0]) + torch.einsum('bli,io->blo', x_real, self.W_v[1])
+        V = torch.stack([V_real, V_imag], dim=-1)
+
+        Q_complex = torch.view_as_complex(Q)
+        K_complex = torch.view_as_complex(K)
+        V_complex = torch.view_as_complex(V)
+        
+        scale = 1 / math.sqrt(N)
+
+        scores = torch.einsum('bik,bjk->bij', Q_complex, K_complex) * scale
+
+        mask = torch.triu(
+            torch.ones(L, L, dtype=torch.bool, device=x.device), 
+            diagonal=1
+        ).transpose(0, 1)
+        mask = mask.unsqueeze(0).expand(B, -1, -1)
+        scores = scores.masked_fill(mask, -float('inf'))
+
+        attention = torch.softmax(scores.real, dim=-1)
+        output = attention @ V_complex.real
+
+        return output
 
 class NodeWiseTransform(nn.Module):
     def __init__(self, 

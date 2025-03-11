@@ -10,6 +10,8 @@ import learner
 import time
 import GAT_Func
 
+from torch.utils.checkpoint import checkpoint
+
 # system configuration
 use_cuda = True
 device = torch.device("cuda:0" if use_cuda and torch.cuda.is_available() else "cpu")
@@ -49,7 +51,7 @@ test_dataset = fn.CreateDataset(test_occupancy, test_price, seq_l, pre_l, device
 test_loader = DataLoader(test_dataset, batch_size=len(test_occupancy), shuffle=False)
 
 # training setting
-model = GAT_Func.GAT_Multi(seq_l, 4, 1, 0, 0.2, 1).to(device)
+model = GAT_Func.GAT_Multi(seq_l, 4, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
 optimizer = torch.optim.Adam(model.parameters(), weight_decay=0.00001)
 
 loss_function = torch.nn.MSELoss()
@@ -77,7 +79,7 @@ if is_train is True:
             occupancy, price, label = data
 
             optimizer.zero_grad()
-            predict = model(occupancy, adj_dense_cuda)
+            predict = model(occupancy, price)
             loss = loss_function(predict, label)
             loss.backward()
             optimizer.step()
@@ -92,7 +94,7 @@ if is_train is True:
             '''
             model.train()
             occupancy, price, label = data
-            predict = model(occupancy, adj_dense_cuda)
+            predict = model(occupancy, price)
             loss = loss_function(predict, label)
             if loss.item() < valid_loss:
                 valid_loss = loss.item()
@@ -121,7 +123,7 @@ for j, data in enumerate(test_loader):
             torch.cuda.synchronize()  # Synchronize before measuring
             memory_before = torch.cuda.memory_allocated()
 
-        predict = model(occupancy, adj_dense_cuda)
+        predict = model(occupancy, price)
 
         # End memory tracking
         if torch.cuda.is_available():
