@@ -270,15 +270,6 @@ class GAT_Multi(nn.Module):
         self.scale = 0.02
         self.sparsity_threshold=sparsity_threshold
 
-        self.embed_size = embed_size
-        self.number_frequency = 1
-        self.frequency_size = self.embed_size // self.number_frequency
-        self.embeddings = nn.Parameter(torch.randn(1, self.embed_size))
-        self.decoder2 = nn.Linear(self.embed_size, 1)
-        self.hidden_size_factor = hidden_size_factor
-        self.scale = 0.02
-        self.sparsity_threshold=sparsity_threshold
-
         self.attentions = nn.ModuleList([
             GraphAttentionLayer(nfeat, nhid//nheads, dropout, alpha) 
             # GraphAttentionLayer(nfeat, nhid, dropout, alpha) 
@@ -310,11 +301,8 @@ class GAT_Multi(nn.Module):
 
     def forward(self, x, prc):
         residual = x
-        x = torch.stack([x, prc], dim=3)
-        x = self.encoder(x)
-        x = torch.squeeze(x)
+        
         # x = F.dropout(x, self.dropout, training=self.training)
-        x = self.FGCN(x) + residual
         multi_head_outputs = []
         for att in self.attentions:
             att_output = att(x, self.adj)  # [batch_size, N, nhid]qqq
@@ -331,9 +319,12 @@ class GAT_Multi(nn.Module):
         x = torch.stack(fused_features, dim=1)
         
         x = F.dropout(x, self.dropout, training=self.training)
-        x = F.elu(self.out_att(x, self.adj)) + residual  # [batch_size, N, nclass]
+        x = F.elu(self.out_att(x, self.adj)) + self.FGCN(residual) + residual  # [batch_size, N, nclass]
+        x = torch.stack([x, prc], dim=3)
+        x = self.encoder(x)
+        x = torch.squeeze(x) + residual
         x = self.activate(x)
-        x = self.decoder(x) + residual
+        x = self.decoder(x)
         return x[:,:,-1]
     
     def tokenEmb(self, x):
