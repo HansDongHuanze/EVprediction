@@ -51,7 +51,8 @@ test_dataset = fn.CreateDataset(test_occupancy, test_price, seq_l, pre_l, device
 test_loader = DataLoader(test_dataset, batch_size=len(test_occupancy), shuffle=False)
 
 # training setting
-model = GAT_Func.GAT_Multi(seq_l, 4, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
+# model = GAT_Func.GAT_Multi(seq_l, 4, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
+model = GAT_Func.GAT_Fourier(seq_l, seq_l // 2 + 1, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
 optimizer = torch.optim.Adam(model.parameters(), weight_decay=0.00001)
 
 loss_function = torch.nn.MSELoss()
