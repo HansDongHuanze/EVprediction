@@ -9,6 +9,7 @@ import models
 import learner
 import time
 import GAT_Func
+import FourierGAT
 
 from torch.utils.checkpoint import checkpoint
 
@@ -52,7 +53,7 @@ test_loader = DataLoader(test_dataset, batch_size=len(test_occupancy), shuffle=F
 
 # training setting
 # model = GAT_Func.GAT_Multi(seq_l, 4, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
-model = GAT_Func.GAT_Fourier(seq_l, seq_l // 2 + 1, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
+model = FourierGAT.GAT_Fourier(seq_l, seq_l, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
 optimizer = torch.optim.Adam(model.parameters(), weight_decay=0.00001)
 
 loss_function = torch.nn.MSELoss()
