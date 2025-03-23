@@ -31,48 +31,49 @@ class CoupFourGAT(nn.Module):
         self.sparsity_threshold=sparsity_threshold
 
         self.attentions = nn.ModuleList([
-            CFGATLayer(nfeat, nfeat, dropout, alpha) 
+            CFGATLayer(nfeat // 2, nfeat // 2, dropout, alpha) 
             # GraphAttentionLayer(nfeat, nhid, dropout, alpha) 
             for _ in range(nheads)
         ])
         for i, attention in enumerate(self.attentions):
             self.add_module('attention_{}'.format(i), attention)
-        self.norm = nn.LayerNorm(nfeat)
+        self.norm = nn.LayerNorm(nfeat // 2)
         # self.out_att = GraphAttentionLayer(nhid * nheads, nclass, dropout=dropout, alpha=alpha, concat=False)
         self.encoder = nn.Linear(2, 1)
         self.activate = nn.LeakyReLU(0.01)
         self.decoder = nn.Linear(nfeat, 1)
         self.mapping = nn.Linear(nfeat, nfeat)
+        self.norm_2 = nn.LayerNorm(self.nfeat)
 
-        self.att_map = nn.Linear(num_nodes, self.nfeat)
+        self.att_map = nn.Linear(num_nodes, self.nfeat // 2)
 
-        self.gate_fusion = GateFusion(in_dim=nhid)
+        self.gate_fusion = GateFusion(in_dim=nfeat // 2)
 
         self.W_q = nn.ParameterList([
-            nn.Parameter(torch.randn(self.nfeat, self.nfeat)),
-            nn.Parameter(torch.randn(self.nfeat, self.nfeat))
+            nn.Parameter(torch.randn(self.nfeat // 2, self.nfeat // 2)),
+            nn.Parameter(torch.randn(self.nfeat // 2, self.nfeat // 2))
         ])
         self.W_k = nn.ParameterList([
-            nn.Parameter(torch.randn(self.nfeat, self.nfeat)),
-            nn.Parameter(torch.randn(self.nfeat, self.nfeat))
+            nn.Parameter(torch.randn(self.nfeat // 2, self.nfeat // 2)),
+            nn.Parameter(torch.randn(self.nfeat // 2, self.nfeat // 2))
         ])
         self.W_v = nn.ParameterList([
-            nn.Parameter(torch.randn(self.nfeat, self.nfeat)),
-            nn.Parameter(torch.randn(self.nfeat, self.nfeat))
+            nn.Parameter(torch.randn(self.nfeat // 2, self.nfeat // 2)),
+            nn.Parameter(torch.randn(self.nfeat // 2, self.nfeat // 2))
         ])
         self.attention_blocks = AttentionBlocks(
             self.W_q, self.W_k, self.W_v, self.att_map, num_nodes, nfeat
         )
 
-        self.complexMapping = nn.Linear(self.nfeat, self.nfeat // 2)
+        self.complexMapping = nn.Linear(self.nfeat // 2, self.nfeat // 2)
     
     def forward(self, x, prc):
         residual = x
         
-        # x = F.dropout(x, self.dropout, training=self.training)
-        x = self.FGCN(x)
-        
         x = F.dropout(x, self.dropout, training=self.training)
+        x = self.norm_2(self.FGCN(x)) + residual
+         
+        # x = F.dropout(x, self.dropout, training=self.training)
         # x = F.elu(self.out_att(x, self.adj)) + self.FGCN(residual) + residual  # [batch_size, N, nclass]
         x = torch.stack([x, prc], dim=3)
         x = self.encoder(x)
@@ -99,7 +100,7 @@ class CoupFourGAT(nn.Module):
 
         for i in range(heads_stack.size(2)):
             node_features = heads_stack[:, :, i, :]  # [B=512, num_heads=1, in_dim=4]
-            fused_node = self.gate_fusion(node_features.reshape(self.nheads,-1,self.nfeat))  # [512,7]
+            fused_node = self.gate_fusion(node_features.reshape(self.nheads,-1,self.nfeat // 2))  # [512,7]
             fused_features.append(fused_node + node_features.mean(dim=1))
         x = torch.stack(fused_features, dim=1)  # [512,247,7]
         return x
@@ -114,6 +115,9 @@ class CoupFourGAT(nn.Module):
         # print(x.shape)
 
         x = torch.fft.fft(x, dim=-1, norm="ortho")
+        res_complex = x
+        x = x[:,:,:(self.nfeat // 2)]
+        half_res_complex = x
 
         x = checkpoint(
             self.freq_attention,  # 要包装的函数
@@ -125,18 +129,25 @@ class CoupFourGAT(nn.Module):
             use_reentrant=False   # 推荐设置（适用于PyTorch 1.11+）
         )
 
+        x = x + half_res_complex
+
         x = checkpoint(
             self.fourierGC,
             x,
             use_reentrant=False,
             preserve_rng_state=False
         )
+
+        x = x + half_res_complex
+
         real_image = torch.stack([x.real, x.imag], dim = 0)
         half = self.complexMapping(real_image)
+        half = self.activate(half)
         half_comp = torch.view_as_complex(torch.stack([half[0],half[1]],dim=-1))
         conj_half = torch.conj(half_comp)
         x = torch.cat((half_comp, conj_half), dim = 2)
-        
+        x = x + res_complex
+
         x = torch.fft.ifft(x, dim=-1, norm="ortho").real
         return x + res
 
