@@ -10,7 +10,8 @@ import numpy as np
 
 import math
 from torch.utils.checkpoint import checkpoint
-
+import pytorch_wavelets as pw
+from pytorch_wavelets import DWT1D
 from typing import List
 
 from torch.nn import Transformer, TransformerEncoder, TransformerEncoderLayer
@@ -20,7 +21,8 @@ device = torch.device("cuda:0" if use_cuda and torch.cuda.is_available() else "c
 fn.set_seed(seed=2023, flag=True)
 
 class WaveletGAT(nn.Module):
-    def __init__(self, nfeat, nhid, nclass, dropout, alpha, nheads, adj, num_nodes = 247, hidden_size_factor=1, embed_size=32, sparsity_threshold=0.01, levels=3):
+    def __init__(self, nfeat, nhid, nclass, dropout, alpha, nheads, adj, 
+                 num_nodes = 247, hidden_size_factor=1, embed_size=32, sparsity_threshold=0.01, wavelet='db4', level=3,):
         super(WaveletGAT, self).__init__()
         self.adj = adj
         self.nfeat = nfeat
@@ -35,6 +37,22 @@ class WaveletGAT(nn.Module):
         self.scale = 0.02
         self.sparsity_threshold=sparsity_threshold
         self.num_nodes = num_nodes
+
+        self.wavelet_type = wavelet
+        self.decomp_level = level
+
+        self.dwt_layer = DWT1D(wave=self.wavelet_type, J=self.decomp_level)
+
+        # Calculate input dimensions for both branches
+        dummy_input = torch.randn(1, num_nodes, nfeat)
+        
+        # Wavelet branch dimension calculation
+        yL, yH = self.dwt_layer(dummy_input)
+        coeffs_list = [yL] + [h.unsqueeze(2) for h in yH]
+        wavelet_dim = sum(c.reshape(1, num_nodes, -1).shape[-1] for c in coeffs_list)
+
+        self.wavelet_attention = nn.TransformerEncoderLayer(wavelet_dim, nhead=1)
+        self.wavelet_linear = nn.Linear(wavelet_dim, nfeat)
 
         self.attentions = nn.ModuleList([
             CFGATLayer(nfeat, nfeat, dropout, alpha) 
@@ -140,22 +158,25 @@ class WaveletGAT(nn.Module):
         res = x
         B, N, L = x.shape  # [512, 247, 12]
 
-        x_wave = self.wavelet_transform_along_last_dim_gpu(x, level=2).to(device).float()
+        yL, yH = self.dwt_layer(x)
+        coeffs_list = [yL] + [h.unsqueeze(2) for h in yH]
+        coeffs_flat = torch.cat([
+            c.reshape(B,N, -1)
+            for c in coeffs_list
+        ], dim=-1)
 
-        x = checkpoint(
-            self.wavelet_time_fusion,
-            x,
-            x_wave,
-            B,
-            N,
-            self.nfeat,
-            preserve_rng_state=False,
-            use_reentrant=False
+        coeffs_flat = checkpoint(
+            self.wavelet_attention,
+            coeffs_flat,
+            use_reentrant=False,
+            preserve_rng_state=False
         )
+
+        coeffs_flat = self.wavelet_linear(coeffs_flat)
 
         x = checkpoint(
             self.waveletGC,
-            x,
+            coeffs_flat,
             use_reentrant=False,
             preserve_rng_state=False
         )
