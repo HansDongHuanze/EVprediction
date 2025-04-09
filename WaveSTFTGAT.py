@@ -4,7 +4,8 @@ import models
 import torch.nn.functional as F
 import functions as fn
 import copy
-
+import pytorch_wavelets as pw
+from pytorch_wavelets import DWT1D
 import math
 from torch.utils.checkpoint import checkpoint
 
@@ -15,7 +16,8 @@ device = torch.device("cuda:0" if use_cuda and torch.cuda.is_available() else "c
 fn.set_seed(seed=2023, flag=True)
 
 class WaveSTFTGAT(nn.Module):
-    def __init__(self, nfeat, nhid, nclass, dropout, alpha, nheads, adj, num_nodes = 247, hidden_size_factor=1, embed_size=32, sparsity_threshold=0.01, levels=3):
+    def __init__(self, nfeat, nhid, nclass, dropout, alpha, nheads, adj, 
+                 num_nodes = 247, hidden_size_factor=1, embed_size=32, sparsity_threshold=0.01, wavelet='db4', level=3,):
         super(WaveSTFTGAT, self).__init__()
         self.adj = adj
         self.nfeat = nfeat
@@ -29,6 +31,23 @@ class WaveSTFTGAT(nn.Module):
         self.hidden_size_factor = hidden_size_factor
         self.scale = 0.02
         self.sparsity_threshold=sparsity_threshold
+        self.num_nodes = num_nodes
+
+        self.wavelet_type = wavelet
+        self.decomp_level = level
+
+        self.dwt_layer = DWT1D(wave=self.wavelet_type, J=self.decomp_level)
+
+        # Calculate input dimensions for both branches
+        dummy_input = torch.randn(1, num_nodes, nfeat)
+        
+        # Wavelet branch dimension calculation
+        yL, yH = self.dwt_layer(dummy_input)
+        coeffs_list = [yL] + [h.unsqueeze(2) for h in yH]
+        wavelet_dim = sum(c.reshape(1, num_nodes, -1).shape[-1] for c in coeffs_list)
+
+        self.wavelet_attention = nn.TransformerEncoderLayer(wavelet_dim, nhead=1)
+        self.wavelet_linear = nn.Linear(wavelet_dim, nfeat)
 
         self.attentions_spart = nn.ModuleList([
             CFGATLayer(nfeat, nfeat, dropout, alpha) 
@@ -141,6 +160,17 @@ class WaveSTFTGAT(nn.Module):
         x = torch.stack(fused_features, dim=1)  # [512,247,7]
         return x
     
+    def wavelet_transform(self, x):
+        B, N, L = x.shape  # [512, 247, 12]
+
+        yL, yH = self.dwt_layer(x)
+        coeffs_list = [yL] + [h.unsqueeze(2) for h in yH]
+        coeffs_flat = torch.cat([
+            c.reshape(B,N, -1)
+            for c in coeffs_list
+        ], dim=-1)
+        return coeffs_flat
+    
     def atten_com_temp(self, x):
         res = x
         multi_head_outputs = []
@@ -186,9 +216,10 @@ class WaveSTFTGAT(nn.Module):
         x_stft = torch.view_as_complex(x_stft)
         x_stft = x_stft.reshape(B, N, -1)  # [512, 247, 12]
 
-        x_real_wave = self.wavelet_transform_along_last_dim_gpu(x_stft.real, level=2).to(device).float()
-        x_imag_wave = self.wavelet_transform_along_last_dim_gpu(x_stft.imag, level=2).to(device).float()
-
+        x_real_wave = self.wavelet_transform(x_stft.real)
+        x_real_wave = self.wavelet_linear(x_real_wave)
+        x_imag_wave = self.wavelet_transform(x_stft.imag)
+        x_imag_wave = self.wavelet_linear(x_imag_wave)
         x_stft = torch.stack([x_real_wave, x_imag_wave], dim=-1)
         x_stft = torch.view_as_complex(x_stft)
 

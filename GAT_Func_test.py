@@ -60,8 +60,8 @@ test_loader = DataLoader(test_dataset, batch_size=len(test_occupancy), shuffle=F
 # model = ConvFourGAT.CoupFourGAT(seq_l, seq_l, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
 # model = FreTimeFusion.CoupFourGAT(seq_l, seq_l, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
 # model = STFTTimeFusion.CoupFourGAT(seq_l, seq_l, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
-model = waveletGAT.WaveletGAT(seq_l, seq_l, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
-# model = WaveSTFTGAT.WaveSTFTGAT(seq_l, seq_l, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
+# model = waveletGAT.WaveletGAT(seq_l, seq_l, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
+model = WaveSTFTGAT.WaveSTFTGAT(seq_l, seq_l, 1, 0, 0.2, 1, adj=adj_dense_cuda).to(device)
 optimizer = torch.optim.Adam(model.parameters(), weight_decay=0.00001)
 
 loss_function = torch.nn.MSELoss()
