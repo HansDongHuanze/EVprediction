@@ -30,7 +30,8 @@ def create_rnn_data(dataset, lookback, predict_time):
     y = []
     for i in range(len(dataset) - lookback - predict_time):
         x.append(dataset[i:i + lookback])
-        y.append(dataset[i + lookback + predict_time - 1])
+        # y.append(dataset[i + lookback + predict_time - 1])
+        y.append(dataset[i + lookback : i + lookback + predict_time])
     return np.array(x), np.array(y)
 
 
@@ -98,7 +99,7 @@ class CreateDataset(Dataset):
     def __getitem__(self, idx):  # occ: batch, seq, node
         output_occ = torch.transpose(self.occ[idx, :, :], 0, 1).to(self.device)
         output_prc = torch.transpose(self.prc[idx, :, :], 0, 1).to(self.device)
-        output_label = self.label[idx, :].to(self.device)
+        output_label = torch.transpose(self.label[idx, :, :], 0, 1).to(self.device)
         return output_occ, output_prc, output_label
 
 
@@ -196,9 +197,10 @@ class PseudoDataset(Dataset):
         # to device
         output_occ = torch.transpose(self.occ[idx, :, :], 0, 1).to(self.device)
         output_prc = torch.transpose(self.prc[idx, :, :], 0, 1).to(self.device)
-        output_label = self.label[idx, :].to(self.device)
+        output_label = torch.transpose(self.label[idx, :, :], 0, 1).to(self.device)
         output_pseudo_prc = torch.transpose(pseudo_prc, 0, 1).to(self.device)
         output_pseudo_label = pseudo_label.to(self.device)
+        output_pseudo_label = torch.transpose(output_pseudo_label, 0, 1)
 
         return output_occ, output_prc, output_label, output_pseudo_prc, output_pseudo_label
 
